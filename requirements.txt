@@ -1,0 +1,9 @@
+# requirements.txt
+#
+# List of Python packages required to run the bot.
+# Install these using the command: pip install -r requirements.txt
+
+python-dotenv
+# The [job-queue] extra is required for scheduled background tasks
+python-telegram-bot[job-queue]
+requests
