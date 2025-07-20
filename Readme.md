@@ -68,13 +68,13 @@ The bot needs to know where to send messages.
 
    \# \--- Primary Node Configuration (Required) \---  
    \# Your main node pair (e.g., Nethermind/Nimbus)  
-   PRIMARY\_BEACON\_NODE\_URL="http://192.168.1.162:5052"  
-   PRIMARY\_EXECUTION\_NODE\_URL="http://192.168.1.162:8545"
+   PRIMARY\_BEACON\_NODE\_URL="YOURBNIP:PORT"  
+   PRIMARY\_EXECUTION\_NODE\_URL="YOURENIP:PORT"
 
    \# \--- Fallback Node Configuration (Optional, but highly recommended) \---  
    \# Your backup node pair (e.g., Besu/Lighthouse)  
-   FALLBACK\_BEACON\_NODE\_URL="http://192.168.1.110:5052"  
-   FALLBACK\_EXECUTION\_NODE\_URL="http://192.168.1.110:8545"
+   FALLBACK\_BEACON\_NODE\_URL="YOURBNIP:PORT"  
+   FALLBACK\_EXECUTION\_NODE\_URL="YOURENIP:PORT"
 
    \# \--- Validator Configuration \---  
    \# A comma-separated list of your validator indices. NO SPACES after commas.  
