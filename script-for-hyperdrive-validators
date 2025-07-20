@@ -1,0 +1,2 @@
+#This script is used in Nodeset Hyperdrive to print a list of all active validators which you can then copy into the .env file
+hyperdrive sw v s | grep -o "Index [0-9]\+" | awk '{print $2;}' | paste -sd,
