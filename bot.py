@@ -74,7 +74,7 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()
-        last_lines = lines[-100:] # Corrected to 100 lines
+        last_lines = lines[-20:] # Corrected to 20 lines
         log_text = "".join(last_lines).replace("`", "'")
         if not log_text:
             log_text = "Log file empty."
