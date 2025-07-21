@@ -3,7 +3,7 @@
 # A Telegram bot that monitors Ethereum validators and node health, with
 # automatic failover and on-demand status commands.
 #
-# V16 - Added /confirm command for on-demand health summary & fixed /logs line count.
+# V19 - Improved node health check to compare CL/EL block hashes for accuracy.
 
 import os
 import logging
@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 # --- Constants ---
 EPOCHS_PER_SYNC_COMMITTEE_PERIOD = 256
 UPCOMING_NOTIFICATION_EPOCH_THRESHOLD = 15
-NODE_SYNC_TOLERANCE_BLOCKS = 3
 
 # --- Environment Variable Loading ---
 try:
@@ -74,7 +73,7 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()
-        last_lines = lines[-20:] # Corrected to 20 lines
+        last_lines = lines[-20:]
         log_text = "".join(last_lines).replace("`", "'")
         if not log_text:
             log_text = "Log file empty."
@@ -82,34 +81,36 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error reading logs: {e}")
 
+def format_health_status_message(health_info: dict) -> str:
+    """Formats a health status dictionary into a readable string."""
+    status = health_info.get('status', 'N/A').replace('_', ' ').title()
+    if status == 'Cl Syncing':
+        sync_dist = health_info.get('sync_distance', 'N/A')
+        status += f" (Distance: {sync_dist} slots)"
+    return status
+
 async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Runs an on-demand health and validator status check."""
     if str(update.effective_chat.id) != TELEGRAM_CHAT_ID: return
     await update.message.reply_text("Running on-demand checks, please wait...")
 
-    # Check nodes
     primary_health = await check_node_health(PRIMARY_BEACON_URL, PRIMARY_EXECUTION_URL)
     fallback_health = await check_node_health(FALLBACK_BEACON_URL, FALLBACK_EXECUTION_URL)
-
-    # Check validators against the primary node
-    validator_summary = await get_validator_summary(PRIMARY_BEACON_URL)
-
-    # Build response message
-    primary_status = primary_health.get('status', 'N/A').replace('_', ' ').title()
-    fallback_status = fallback_health.get('status', 'N/A').replace('_', ' ').title()
     
-    val_message = "Could not fetch validator status."
+    active_node_for_summary = PRIMARY_BEACON_URL if primary_health['status'] != 'cl_unreachable' else FALLBACK_BEACON_URL
+    validator_summary = await get_validator_summary(active_node_for_summary)
+
+    val_message = "Could not fetch validator status (no reachable CL)."
     if validator_summary:
         val_message = f"{validator_summary['active_count']}/{validator_summary['total_count']} validators are active."
 
     summary_message = (
         f"*On-Demand Status Report*\n\n"
         f"Validators: {val_message}\n"
-        f"Primary Node: *{primary_status}*\n"
-        f"Fallback Node: *{fallback_status}*"
+        f"Primary Node: *{format_health_status_message(primary_health)}*\n"
+        f"Fallback Node: *{format_health_status_message(fallback_health)}*"
     )
     await update.message.reply_text(summary_message, parse_mode='Markdown')
-
 
 async def send_telegram_message(bot: Bot, message: str):
     try:
@@ -130,27 +131,48 @@ async def post_shutdown(application: Application):
 # --- Node Health & Core Logic ---
 
 async def check_node_health(beacon_url: str, execution_url: str) -> dict:
+    """Checks node health: CL syncing, EL reachability, and CL/EL hash consistency."""
     if not beacon_url or not execution_url:
         return {'is_healthy': False, 'status': 'not_configured'}
+
+    # 1. Check Consensus Layer Sync Status
     try:
-        url = f"{beacon_url}/eth/v2/beacon/blocks/head"
-        cl_response = requests.get(url, headers=HEADERS, timeout=5)
-        cl_response.raise_for_status()
-        cl_block_number = int(cl_response.json()['data']['message']['body']['execution_payload']['block_number'])
+        sync_response = requests.get(f"{beacon_url}/eth/v1/node/syncing", headers=HEADERS, timeout=5)
+        sync_response.raise_for_status()
+        sync_data = sync_response.json()['data']
+        if sync_data.get('is_syncing', True):
+            logger.warning(f"Node at {beacon_url} is still syncing.")
+            return {'is_healthy': False, 'status': 'cl_syncing', 'sync_distance': sync_data.get('sync_distance')}
     except Exception as e:
-        logger.warning(f"Health check failed for CL at {beacon_url}: {e}")
+        logger.warning(f"Health check failed for CL at {beacon_url} (syncing endpoint): {e}")
         return {'is_healthy': False, 'status': 'cl_unreachable'}
+
+    # 2. Check CL/EL Block Hash Consistency
     try:
-        payload = {"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}
+        blocks_response = requests.get(f"{beacon_url}/eth/v2/beacon/blocks/head", headers=HEADERS, timeout=5)
+        blocks_response.raise_for_status()
+        cl_block_hash = blocks_response.json()['data']['message']['body']['execution_payload']['block_hash']
+    except Exception as e:
+        logger.warning(f"Health check failed for CL at {beacon_url} (blocks endpoint): {e}")
+        return {'is_healthy': False, 'status': 'cl_unreachable'}
+
+    try:
+        payload = {"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest", False],"id":1}
         el_response = requests.post(execution_url, headers=JSON_RPC_HEADERS, json=payload, timeout=5)
         el_response.raise_for_status()
-        el_block_number = int(el_response.json()['result'], 16)
+        el_block_hash = el_response.json()['result']['hash']
     except Exception as e:
         logger.warning(f"Health check failed for EL at {execution_url}: {e}")
         return {'is_healthy': False, 'status': 'el_unreachable'}
-    if abs(cl_block_number - el_block_number) > NODE_SYNC_TOLERANCE_BLOCKS:
-        return {'is_healthy': False, 'status': 'out_of_sync'}
+    
+    if cl_block_hash != el_block_hash:
+        logger.warning(f"Node at {beacon_url} has CL/EL hash mismatch. CL: {cl_block_hash}, EL: {el_block_hash}")
+        return {'is_healthy': False, 'status': 'cl_el_mismatch'}
+
+    # 3. If all checks pass
+    logger.info(f"Node at {beacon_url} is healthy and synced.")
     return {'is_healthy': True, 'status': 'healthy'}
+
 
 async def get_current_slot_and_epoch(beacon_url: str):
     try:
@@ -164,7 +186,6 @@ async def get_current_slot_and_epoch(beacon_url: str):
 # --- Validator Check Functions ---
 
 async def get_validator_summary(beacon_url: str) -> dict | None:
-    """Fetches validator statuses and returns a count."""
     if not beacon_url: return None
     try:
         url = f"{beacon_url}/eth/v1/beacon/states/head/validators?id={','.join(VALIDATOR_INDICES)}"
@@ -177,21 +198,6 @@ async def get_validator_summary(beacon_url: str) -> dict | None:
         logger.error(f"Error getting validator summary from {beacon_url}: {e}")
         return None
 
-async def check_validator_status(bot: Bot, beacon_url: str):
-    """Checks for status changes and sends alerts."""
-    try:
-        url = f"{beacon_url}/eth/v1/beacon/states/head/validators?id={','.join(VALIDATOR_INDICES)}"
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        for info in response.json()['data']:
-            index, status = str(info['index']), info['status']
-            if "active" not in status and "active" in validator_last_status.get(index, "active"):
-                await send_telegram_message(bot, f"🚨 *VALIDATOR OFFLINE* 🚨\n\nIndex: `{index}`\nStatus: `{status.replace('_', ' ').title()}`")
-            validator_last_status[index] = status
-    except Exception as e:
-        logger.error(f"Error checking validator status: {e}")
-
-# ... (All other validator check functions like proposals and sync duties remain the same) ...
 async def check_confirmed_proposals(bot: Bot, current_slot: int, beacon_url: str):
     proposals_to_remove = []
     for slot, info in list(pending_proposals.items()):
@@ -230,6 +236,19 @@ async def check_upcoming_proposals(bot: Bot, current_epoch: int, beacon_url: str
     except Exception as e:
         logger.error(f"Error checking for upcoming proposals: {e}")
 
+async def check_validator_status(bot: Bot, beacon_url: str):
+    try:
+        url = f"{beacon_url}/eth/v1/beacon/states/head/validators?id={','.join(VALIDATOR_INDICES)}"
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        for info in response.json()['data']:
+            index, status = str(info['index']), info['status']
+            if "active" not in status and "active" in validator_last_status.get(index, "active"):
+                await send_telegram_message(bot, f"🚨 *VALIDATOR OFFLINE* 🚨\n\nIndex: `{index}`\nStatus: `{status.replace('_', ' ').title()}`")
+            validator_last_status[index] = status
+    except Exception as e:
+        logger.error(f"Error checking validator status: {e}")
+
 async def check_sync_duties(bot: Bot, current_epoch: int, beacon_url: str):
     monitored_set = set(VALIDATOR_INDICES)
     next_period_start_epoch = ((current_epoch // EPOCHS_PER_SYNC_COMMITTEE_PERIOD) + 1) * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
@@ -262,9 +281,7 @@ async def check_sync_duties(bot: Bot, current_epoch: int, beacon_url: str):
         if state['notified_end']:
             del sync_duty_state[duty_key]
 
-
 async def run_validator_checks(context: ContextTypes.DEFAULT_TYPE, beacon_url: str):
-    """Runs all validator-specific checks against a healthy node."""
     current_slot, current_epoch = await get_current_slot_and_epoch(beacon_url)
     if not current_slot: return
     logger.info(f"--- Running validator checks on {beacon_url} for slot {current_slot} ---")
@@ -280,30 +297,36 @@ async def health_check_and_monitor(context: ContextTypes.DEFAULT_TYPE):
     """Main job: checks node health, fails over, and runs validator checks."""
     bot = context.bot
     active_beacon_url = None
+
     primary_health = await check_node_health(PRIMARY_BEACON_URL, PRIMARY_EXECUTION_URL)
     if primary_health['status'] != node_health_state['primary']:
-        status_msg = primary_health.get('status', 'N/A').replace('_', ' ').title()
+        logger.info(f"Primary node status changed from '{node_health_state['primary']}' to '{primary_health['status']}'.")
+        status_msg = format_health_status_message(primary_health)
         if primary_health['is_healthy']:
             await send_telegram_message(bot, f"✅ *Primary Node Recovered*\nStatus: {status_msg}")
         else:
             await send_telegram_message(bot, f"🚨 *Primary Node Unhealthy*\nStatus: {status_msg}")
         node_health_state['primary'] = primary_health['status']
+
     if primary_health['is_healthy']:
         active_beacon_url = PRIMARY_BEACON_URL
     else:
         logger.warning("Primary node unhealthy. Checking fallback.")
         fallback_health = await check_node_health(FALLBACK_BEACON_URL, FALLBACK_EXECUTION_URL)
         if fallback_health['status'] != node_health_state['fallback']:
-            status_msg = fallback_health.get('status', 'N/A').replace('_', ' ').title()
+            logger.info(f"Fallback node status changed from '{node_health_state['fallback']}' to '{fallback_health['status']}'.")
+            status_msg = format_health_status_message(fallback_health)
             if fallback_health['is_healthy']:
                 await send_telegram_message(bot, f"✅ *Failing over to Fallback Node*\nStatus: {status_msg}")
             else:
                 await send_telegram_message(bot, f"🚨 *Fallback Node Unhealthy*\nStatus: {status_msg}")
             node_health_state['fallback'] = fallback_health['status']
+        
         if fallback_health['is_healthy']:
             active_beacon_url = FALLBACK_BEACON_URL
         else:
             logger.error("Both primary and fallback nodes are unhealthy.")
+
     if active_beacon_url:
         await run_validator_checks(context, active_beacon_url)
     else:
