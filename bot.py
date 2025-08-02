@@ -3,7 +3,7 @@
 # A Telegram bot that monitors Ethereum validators and node health, with
 # automatic failover and on-demand status commands.
 #
-# V20 - Implemented accurate block reward calculation by checking EL balance changes.
+# V21 - Switched to Beaconcha.in API for proposal confirmations to get accurate MEV rewards and builder info.
 
 import os
 import logging
@@ -45,6 +45,7 @@ try:
     PRIMARY_EXECUTION_URL = os.getenv("PRIMARY_EXECUTION_NODE_URL")
     FALLBACK_BEACON_URL = os.getenv("FALLBACK_BEACON_NODE_URL")
     FALLBACK_EXECUTION_URL = os.getenv("FALLBACK_EXECUTION_NODE_URL")
+    BEACONCHAIN_API_KEY = os.getenv("BEACONCHAIN_API_KEY") # Optional, for higher rate limits
 
     VALIDATOR_INDICES_STR = os.getenv("VALIDATOR_INDICES")
     if not VALIDATOR_INDICES_STR:
@@ -58,6 +59,8 @@ except Exception as e:
 # --- API Configuration ---
 HEADERS = {"Accept": "application/json"}
 JSON_RPC_HEADERS = {"Content-Type": "application/json"}
+BEACONCHAIN_HEADERS = {"Accept": "application/json", "apikey": BEACONCHAIN_API_KEY}
+
 
 # --- State Management ---
 validator_last_status = {}
@@ -72,7 +75,7 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()
-        last_lines = lines[-20:]
+        last_lines = lines[-100:]
         log_text = "".join(last_lines).replace("`", "'")
         if not log_text:
             log_text = "Log file empty."
@@ -165,56 +168,44 @@ async def get_current_slot_and_epoch(beacon_url: str):
 
 # --- Validator Check Functions ---
 
-async def get_block_rewards(execution_url: str, fee_recipient: str, block_number: int) -> float:
-    """Calculates block rewards by checking the fee recipient's balance change."""
-    try:
-        # Balance before the block
-        payload_before = {"jsonrpc":"2.0","method":"eth_getBalance","params":[fee_recipient, hex(block_number - 1)],"id":1}
-        response_before = requests.post(execution_url, headers=JSON_RPC_HEADERS, json=payload_before, timeout=5)
-        response_before.raise_for_status()
-        balance_before_wei = int(response_before.json()['result'], 16)
-
-        # Balance after the block
-        payload_after = {"jsonrpc":"2.0","method":"eth_getBalance","params":[fee_recipient, hex(block_number)],"id":1}
-        response_after = requests.post(execution_url, headers=JSON_RPC_HEADERS, json=payload_after, timeout=5)
-        response_after.raise_for_status()
-        balance_after_wei = int(response_after.json()['result'], 16)
-
-        reward_wei = balance_after_wei - balance_before_wei
-        return reward_wei / 1e18
-    except Exception as e:
-        logger.error(f"Could not calculate block rewards for block {block_number}: {e}")
-        return 0.0
-
-async def check_confirmed_proposals(bot: Bot, current_slot: int, beacon_url: str, execution_url: str):
+async def check_confirmed_proposals(bot: Bot, current_slot: int):
+    """Checks for past proposals using the Beaconcha.in API for accurate data."""
     proposals_to_remove = []
     for slot, info in list(pending_proposals.items()):
         if int(slot) == current_slot - 1:
             proposals_to_remove.append(slot)
             validator_index = info['validator_index']
-            logger.info(f"Checking confirmation for slot {slot} by {validator_index} on {beacon_url}")
+            logger.info(f"Checking confirmation for slot {slot} via Beaconcha.in...")
             try:
-                url = f"{beacon_url}/eth/v2/beacon/blocks/{slot}"
-                response = requests.get(url, headers=HEADERS, timeout=10)
+                url = f"https://beaconcha.in/api/v1/slot/{slot}"
+                response = requests.get(url, headers=BEACONCHAIN_HEADERS, timeout=10)
+
                 if response.status_code == 404:
                     await send_telegram_message(bot, f"❌ *MISSED PROPOSAL* ❌\n\nValidator `{validator_index}` missed proposal at slot `{slot}`.")
                     continue
+                
                 response.raise_for_status()
                 data = response.json()['data']
-                payload = data['message']['body'].get('execution_payload', {})
-                
-                fee_recipient = payload.get('fee_recipient')
-                block_number = int(payload.get('block_number', '0'))
-                
-                rewards_eth = 0.0
-                if fee_recipient and block_number > 0:
-                    rewards_eth = await get_block_rewards(execution_url, fee_recipient, block_number)
 
-                graffiti = bytes.fromhex(data['message']['body']['graffiti'].replace('0x', '')).decode('utf-8', 'ignore').strip()
-                
-                await send_telegram_message(bot, f"🎉 *PROPOSAL CONFIRMED* 🎉\n\nValidator `{validator_index}` proposed block at slot `{slot}`.\n\n💰 *Block Rewards:* `{rewards_eth:.6f} ETH`\n收款人: `{fee_recipient}`\n🛰️ *Graffiti:* `{graffiti}`")
+                # Beaconcha.in provides the correct reward and builder info directly
+                rewards_eth = data.get('exec_reward_value_eth', 0.0)
+                builder = data.get('exec_builder_pubkey', 'N/A')
+                # A more user-friendly name if available
+                if 'proposer_data' in data and 'builder_name' in data['proposer_data']:
+                    builder = data['proposer_data']['builder_name']
+
+                graffiti = data.get('graffiti_text', 'N/A')
+
+                await send_telegram_message(bot, 
+                    f"🎉 *PROPOSAL CONFIRMED* 🎉\n\n"
+                    f"Validator `{validator_index}` proposed block at slot `{slot}`.\n\n"
+                    f"💰 *Block Rewards:* `{rewards_eth:.6f} ETH`\n"
+                    f"🏗️ *Builder:* `{builder}`\n"
+                    f"🛰️ *Graffiti:* `{graffiti}`"
+                )
             except Exception as e:
-                logger.error(f"Error confirming proposal for slot {slot}: {e}")
+                logger.error(f"Error confirming proposal for slot {slot} via Beaconcha.in: {e}")
+    
     for slot in proposals_to_remove:
         if slot in pending_proposals: del pending_proposals[slot]
 
@@ -292,11 +283,15 @@ async def check_sync_duties(bot: Bot, current_epoch: int, beacon_url: str):
             del sync_duty_state[duty_key]
 
 
-async def run_validator_checks(context: ContextTypes.DEFAULT_TYPE, beacon_url: str, execution_url: str):
+async def run_validator_checks(context: ContextTypes.DEFAULT_TYPE, beacon_url: str):
     current_slot, current_epoch = await get_current_slot_and_epoch(beacon_url)
     if not current_slot: return
     logger.info(f"--- Running validator checks on {beacon_url} for slot {current_slot} ---")
-    await check_confirmed_proposals(context.bot, current_slot, beacon_url, execution_url)
+    
+    # This check is now independent of the active node
+    await check_confirmed_proposals(context.bot, current_slot)
+
+    # These checks still run against the active healthy node
     await check_upcoming_proposals(context.bot, current_epoch, beacon_url)
     if current_slot % 5 == 0:
         await check_validator_status(context.bot, beacon_url)
@@ -305,9 +300,8 @@ async def run_validator_checks(context: ContextTypes.DEFAULT_TYPE, beacon_url: s
     logger.info(f"--- Finished validator checks on {beacon_url} ---")
 
 async def health_check_and_monitor(context: ContextTypes.DEFAULT_TYPE):
-    """Main job: checks node health, fails over, and runs validator checks."""
     bot = context.bot
-    active_beacon_url, active_execution_url = None, None
+    active_beacon_url = None
 
     primary_health = await check_node_health(PRIMARY_BEACON_URL, PRIMARY_EXECUTION_URL)
     if primary_health['status'] != node_health_state['primary']:
@@ -319,7 +313,7 @@ async def health_check_and_monitor(context: ContextTypes.DEFAULT_TYPE):
         node_health_state['primary'] = primary_health['status']
 
     if primary_health['is_healthy']:
-        active_beacon_url, active_execution_url = PRIMARY_BEACON_URL, PRIMARY_EXECUTION_URL
+        active_beacon_url = PRIMARY_BEACON_URL
     else:
         logger.warning("Primary node unhealthy. Checking fallback.")
         fallback_health = await check_node_health(FALLBACK_BEACON_URL, FALLBACK_EXECUTION_URL)
@@ -332,17 +326,20 @@ async def health_check_and_monitor(context: ContextTypes.DEFAULT_TYPE):
             node_health_state['fallback'] = fallback_health['status']
         
         if fallback_health['is_healthy']:
-            active_beacon_url, active_execution_url = FALLBACK_BEACON_URL, FALLBACK_EXECUTION_URL
+            active_beacon_url = FALLBACK_BEACON_URL
         else:
             logger.error("Both primary and fallback nodes are unhealthy.")
 
     if active_beacon_url:
-        await run_validator_checks(context, active_beacon_url, active_execution_url)
+        await run_validator_checks(context, active_beacon_url)
     else:
-        logger.info("No healthy node available. Skipping validator checks.")
+        # Still run the proposal confirmation check even if nodes are down, as it uses an external API
+        logger.info("No healthy local node available. Checking for proposal confirmations via Beaconcha.in...")
+        current_slot, _ = await get_current_slot_and_epoch(PRIMARY_BEACON_URL or FALLBACK_BEACON_URL or "https://beaconcha.in") # Best effort
+        if current_slot:
+            await check_confirmed_proposals(context.bot, current_slot)
 
 def main() -> None:
-    """Initializes and runs the bot application."""
     logger.info("Starting validator monitor bot...")
     if not PRIMARY_BEACON_URL or not PRIMARY_EXECUTION_URL:
         logger.critical("Primary node URLs are not set in .env file. Exiting.")
